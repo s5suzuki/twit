@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use git2::Repository;
 use notify_debouncer_mini::notify::event::{EventKind, Flag, ModifyKind};
 use notify_debouncer_mini::notify::{self, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -14,16 +14,20 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 
 pub type Notifier = Arc<dyn Fn() + Send + Sync>;
 
+type Repos = Arc<Mutex<Vec<(PathBuf, Repository)>>>;
+
 pub struct WorktreeWatcher {
     watcher: RecommendedWatcher,
     pruned: HashMap<PathBuf, u64>,
     dirty: Arc<AtomicBool>,
+    repos: Repos,
 }
 
 impl WorktreeWatcher {
     pub fn new(root: &Path, notifier: Notifier) -> Result<Self, String> {
         let dirty = Arc::new(AtomicBool::new(false));
-        let gitignore = build_gitignore(root);
+        let repos: Repos = Arc::new(Mutex::new(Vec::new()));
+        let shared = repos.clone();
 
         let (tx, rx) = mpsc::channel::<()>();
         spawn_debounce(rx, dirty.clone(), notifier);
@@ -37,7 +41,8 @@ impl WorktreeWatcher {
             if !is_change(&event.kind) {
                 return;
             }
-            if event.paths.iter().all(|p| is_ignored(&gitignore, p)) {
+            let Ok(repos) = shared.lock() else { return };
+            if event.paths.iter().all(|p| is_ignored(&repos, p)) {
                 return;
             }
             let _ = tx.send(());
@@ -52,6 +57,7 @@ impl WorktreeWatcher {
             watcher,
             pruned: HashMap::new(),
             dirty,
+            repos,
         };
         this.prune_ignored(root);
         Ok(this)
@@ -62,23 +68,62 @@ impl WorktreeWatcher {
     }
 
     pub fn prune_ignored(&mut self, root: &Path) {
-        let gitignore = build_gitignore(root);
+        let fresh = open_repos(root);
+        let mut prune = Vec::new();
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !entry.file_type().is_ok_and(|t| t.is_dir()) || !is_ignored(&gitignore, &path) {
-                    continue;
+                if entry.file_type().is_ok_and(|t| t.is_dir()) && is_ignored(&fresh, &path) {
+                    let ino = entry.metadata().map(|m| m.ino()).unwrap_or_default();
+                    prune.push((path, ino));
                 }
-                let ino = entry.metadata().map(|m| m.ino()).unwrap_or_default();
-                if self.pruned.get(&path) == Some(&ino) {
-                    continue;
-                }
-                let _ = self.watcher.unwatch(&path);
-                self.pruned.insert(path, ino);
             }
         }
-        watch_git_dir(&mut self.watcher, root);
+        let mut git_dirs: Vec<PathBuf> = Vec::new();
+        for (_, repo) in &fresh {
+            git_dirs.push(repo.path().to_path_buf());
+            if repo.commondir() != repo.path() {
+                git_dirs.push(repo.commondir().to_path_buf());
+            }
+        }
+        if fresh.is_empty() && root.join(".git").is_dir() {
+            git_dirs.push(root.join(".git"));
+        }
+        if let Ok(mut repos) = self.repos.lock() {
+            *repos = fresh;
+        }
+
+        for (path, ino) in prune {
+            if self.pruned.get(&path) == Some(&ino) {
+                continue;
+            }
+            let _ = self.watcher.unwatch(&path);
+            self.pruned.insert(path, ino);
+        }
+        for dir in &git_dirs {
+            watch_one_git_dir(&mut self.watcher, dir);
+        }
     }
+}
+
+fn open_repos(root: &Path) -> Vec<(PathBuf, Repository)> {
+    let mut out = Vec::new();
+    if let Ok(repo) = Repository::open(root) {
+        push_repo(root.to_path_buf(), repo, &mut out);
+    }
+    out.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+    out
+}
+
+fn push_repo(prefix: PathBuf, repo: Repository, out: &mut Vec<(PathBuf, Repository)>) {
+    if let Ok(subs) = repo.submodules() {
+        for sm in subs {
+            if let Ok(sub) = sm.open() {
+                push_repo(prefix.join(sm.path()), sub, out);
+            }
+        }
+    }
+    out.push((prefix, repo));
 }
 
 fn is_change(kind: &EventKind) -> bool {
@@ -101,27 +146,6 @@ fn spawn_debounce(rx: mpsc::Receiver<()>, dirty: Arc<AtomicBool>, notifier: Noti
     });
 }
 
-fn watch_git_dir(watcher: &mut dyn Watcher, root: &Path) {
-    let Ok(repo) = git2::Repository::open(root) else {
-        let dot = root.join(".git");
-        if dot.is_dir() {
-            watch_one_git_dir(watcher, &dot);
-        }
-        return;
-    };
-    watch_one_git_dir(watcher, repo.path());
-    if repo.commondir() != repo.path() {
-        watch_one_git_dir(watcher, repo.commondir());
-    }
-    if let Ok(subs) = repo.submodules() {
-        for sub in subs {
-            if let Ok(sub_repo) = sub.open() {
-                watch_one_git_dir(watcher, sub_repo.path());
-            }
-        }
-    }
-}
-
 fn watch_one_git_dir(watcher: &mut dyn Watcher, git_dir: &Path) {
     let _ = watcher.watch(git_dir, RecursiveMode::NonRecursive);
     let refs = git_dir.join("refs");
@@ -130,22 +154,15 @@ fn watch_one_git_dir(watcher: &mut dyn Watcher, git_dir: &Path) {
     }
 }
 
-fn build_gitignore(root: &Path) -> Gitignore {
-    let mut b = GitignoreBuilder::new(root);
-    let _ = b.add(root.join(".gitignore"));
-    let _ = b.add_line(None, ".git/");
-    let _ = b.add_line(None, "target/");
-    b.build().unwrap_or_else(|_| Gitignore::empty())
-}
-
-fn is_ignored(gitignore: &Gitignore, path: &Path) -> bool {
+fn is_ignored(repos: &[(PathBuf, Repository)], path: &Path) -> bool {
     if path.components().any(|c| c.as_os_str() == ".git") {
         return !is_interesting_git_path(path);
     }
-    if gitignore
-        .matched_path_or_any_parents(path, path.is_dir())
-        .is_ignore()
-    {
+    let git_ignored = repos.iter().find_map(|(prefix, repo)| {
+        let rel = path.strip_prefix(prefix).ok()?;
+        Some(!rel.as_os_str().is_empty() && repo.is_path_ignored(rel).unwrap_or(false))
+    });
+    if git_ignored == Some(true) {
         return true;
     }
 
@@ -382,6 +399,31 @@ mod tests {
             "notifier must fire on external ref update"
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn nested_gitignore_and_info_exclude_are_respected() {
+        let tmp = std::env::temp_dir().join(format!("twit-watch-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("web/dist")).unwrap();
+        git2::Repository::init(&tmp).unwrap();
+        std::fs::write(tmp.join("web/.gitignore"), "dist/\n").unwrap();
+        std::fs::write(tmp.join(".git/info/exclude"), "*.log\n").unwrap();
+
+        let w = WorktreeWatcher::new(&tmp, Arc::new(|| {})).unwrap();
+        settle(&w);
+
+        std::fs::write(tmp.join("web/dist/bundle.js"), "x\n").unwrap();
+        std::fs::write(tmp.join("web/build.log"), "x\n").unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!w.take_dirty(), "ignored paths must not wake the watcher");
+
+        std::fs::write(tmp.join("web/app.js"), "x\n").unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(w.take_dirty(), "tracked-side paths must wake the watcher");
+
+        drop(w);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

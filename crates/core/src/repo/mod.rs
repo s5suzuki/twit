@@ -21,7 +21,7 @@ pub use ops::{
     delete_tag, discard, fetch, head_has_commit, head_is_pushed, head_message, head_push_refspec,
     merge, merge_abort, merge_continue, primary_remote, pull, push, rebase_abort, rebase_continue,
     rebase_onto, remotes, rename_branch, reset, revert, revert_abort, revert_continue,
-    seq_conflicts, seq_state, stage, stage_hunk, stage_submodule_pointer, stash_apply, stash_drop,
-    stash_list, stash_pop, stash_save, submodule_init, submodule_update, unstage, unstage_hunk,
+    seq_conflicts, seq_state, stage, stage_submodule_pointer, stash_apply, stash_drop, stash_list,
+    stash_pop, stash_save, submodule_init, submodule_update, unstage,
 };
 pub use status::{StatusEntry, StatusKind, load_status};

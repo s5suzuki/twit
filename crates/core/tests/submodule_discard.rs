@@ -97,9 +97,9 @@ fn file_discard_resets_submodule_head() {
 #[test]
 fn diff_partial_discard_resets_submodule_head() {
     let (_tmp, parent, recorded) = setup("partial");
-    let d = repo::file_diff(&parent, "sub", DiffMode::Unstaged).unwrap();
+    let d = repo::file_diff(&parent, "sub", None, DiffMode::Unstaged).unwrap();
     let n = d.rows.len();
-    repo::discard_partial(&parent, "sub", &d.rows, 0, n.saturating_sub(1)).unwrap();
+    repo::discard_partial(&parent, "sub", &d, 0, n.saturating_sub(1)).unwrap();
     assert_eq!(git_out(&parent, &["status", "--porcelain"]), "");
     assert_eq!(
         git_out(&parent.join("sub"), &["rev-parse", "HEAD"]),

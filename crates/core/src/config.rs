@@ -156,7 +156,8 @@ fn default_document() -> Result<DocumentMut, String> {
 }
 
 fn merge_into(existing: &str, cfg: &Config) -> Result<String, String> {
-    let mut doc: DocumentMut = existing.parse().unwrap_or_default();
+    toml::from_str::<Config>(existing).map_err(|e| e.message().to_string())?;
+    let mut doc: DocumentMut = existing.parse().map_err(|e| format!("{e}"))?;
     for (key, item) in document_of(cfg)?.as_table().iter() {
         if item.is_table_like()
             && (doc.contains_key(key) || item.as_table_like().is_some_and(|t| t.is_empty()))
@@ -548,8 +549,20 @@ confirm_delete = true
     }
 
     #[test]
-    fn saving_over_a_corrupt_file_falls_back_to_a_full_write() {
-        let text = merge_into("this is not toml = = =", &Config::default()).unwrap();
+    fn saving_never_overwrites_a_file_that_does_not_load() {
+        assert!(merge_into("this is not toml = = =", &Config::default()).is_err());
+        assert!(
+            merge_into(
+                "vim_input = false\ngraph_commit_limit = \"x\"\n",
+                &Config::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn saving_into_an_empty_file_writes_the_settings() {
+        let text = merge_into("", &Config::default()).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.graph_commit_limit, 200);
     }

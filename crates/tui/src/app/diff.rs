@@ -39,7 +39,12 @@ pub(super) fn diff_mode(staged: bool) -> repo::DiffMode {
 
 impl TuiApp {
     pub(super) fn open_file_diff(&mut self, path: String, staged: bool) {
-        match repo::file_diff(&self.selected, &path, diff_mode(staged)) {
+        match repo::file_diff(
+            &self.selected,
+            &path,
+            self.status_old_path(&path, staged).as_deref(),
+            diff_mode(staged),
+        ) {
             Ok(d) => {
                 self.diff = d;
                 self.selected_file = Some((path.clone(), staged));
@@ -62,7 +67,12 @@ impl TuiApp {
     }
 
     pub(super) fn reload_file_diff(&mut self, path: &str, staged: bool) {
-        match repo::file_diff(&self.selected, path, diff_mode(staged)) {
+        match repo::file_diff(
+            &self.selected,
+            path,
+            self.status_old_path(path, staged).as_deref(),
+            diff_mode(staged),
+        ) {
             Ok(d) => {
                 let sig = repo::hash_rows(&d.rows);
                 let changed = sig != self.diff_sig;
@@ -78,6 +88,14 @@ impl TuiApp {
                 self.diff = FileDiff::empty();
             }
         }
+    }
+
+    pub(super) fn status_old_path(&self, path: &str, staged: bool) -> Option<String> {
+        let entries = if staged { &self.staged } else { &self.unstaged };
+        entries
+            .iter()
+            .find(|e| e.path == path)
+            .and_then(|e| e.old_path.clone())
     }
 
     pub(super) fn rebuild_highlight(&mut self, path: &str) {
@@ -182,8 +200,7 @@ impl TuiApp {
         let Some((lo, hi)) = self.diff_nav.action_range(&self.diff.rows) else {
             return;
         };
-        if let Err(e) = repo::apply_partial(&self.selected, &path, &self.diff.rows, lo, hi, unstage)
-        {
+        if let Err(e) = repo::apply_partial(&self.selected, &path, &self.diff, lo, hi, unstage) {
             self.error = Some(format!("partial stage failed: {e}"));
         } else {
             self.error = None;
@@ -213,8 +230,7 @@ impl TuiApp {
         let Some((lo, hi)) = self.hunk_range_at_cursor() else {
             return;
         };
-        if let Err(e) = repo::apply_partial(&self.selected, &path, &self.diff.rows, lo, hi, unstage)
-        {
+        if let Err(e) = repo::apply_partial(&self.selected, &path, &self.diff, lo, hi, unstage) {
             self.error = Some(format!("hunk stage failed: {e}"));
         } else {
             self.error = None;

@@ -488,7 +488,8 @@ fn two_hunk_repo() -> PathBuf {
 }
 
 fn count_staged_changes(dir: &Path) -> usize {
-    let d = twit_core::repo::file_diff(dir, "x.txt", twit_core::repo::DiffMode::Staged).unwrap();
+    let d =
+        twit_core::repo::file_diff(dir, "x.txt", None, twit_core::repo::DiffMode::Staged).unwrap();
     d.rows
         .iter()
         .filter(|r| {
@@ -1483,5 +1484,62 @@ fn renamed_file_stages_and_unstages_in_one_toggle() {
     assert!(
         find_line(&lines, "Changes (1)").is_some(),
         "one unstaged entry"
+    );
+}
+
+#[test]
+fn commit_key_is_refused_while_a_merge_is_in_progress() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    git(&dir, &["checkout", "-qb", "other"]);
+    std::fs::write(dir.join("a.txt"), "theirs\n").unwrap();
+    git(&dir, &["commit", "-qam", "theirs"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    std::fs::write(dir.join("a.txt"), "ours\n").unwrap();
+    git(&dir, &["commit", "-qam", "ours"]);
+    let merged = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["merge", "-q", "other"])
+        .output()
+        .unwrap();
+    assert!(!merged.status.success(), "fixture must conflict");
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('c'))]);
+    assert!(
+        app.prompt.is_none(),
+        "commit prompt must not open mid-merge"
+    );
+    assert!(
+        app.error
+            .as_deref()
+            .is_some_and(|e| e.contains("finish or abort")),
+        "{:?}",
+        app.error
+    );
+}
+
+#[test]
+fn staged_rename_diff_shows_old_and_new_path() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("old.txt"), "1\n2\n3\n4\n5\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    git(&dir, &["mv", "old.txt", "new.txt"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Enter)]);
+    assert_eq!(
+        app.selected_file.as_ref().map(|(p, s)| (p.as_str(), *s)),
+        Some(("new.txt", true))
+    );
+    assert!(app.diff.rename);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "old.txt  →  new.txt").is_some(),
+        "{lines:#?}"
     );
 }

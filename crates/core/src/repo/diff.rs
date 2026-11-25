@@ -1,9 +1,7 @@
 use std::ops::Range;
 use std::path::Path;
 
-use git2::{
-    ApplyLocation, ApplyOptions, Diff, DiffFindOptions, DiffOptions, Oid, Patch, Repository,
-};
+use git2::{Diff, DiffFindOptions, DiffOptions, Oid, Patch, Repository};
 
 use super::status::StatusKind;
 
@@ -47,6 +45,8 @@ pub struct FileDiff {
     pub conflict: bool,
     pub rename: bool,
     pub binary: bool,
+    pub old_no_eol: bool,
+    pub new_no_eol: bool,
 }
 
 impl FileDiff {
@@ -57,6 +57,8 @@ impl FileDiff {
             conflict: false,
             rename: false,
             binary: false,
+            old_no_eol: false,
+            new_no_eol: false,
         }
     }
 }
@@ -195,45 +197,19 @@ fn hunk_headers(diff: &Diff) -> Result<Vec<String>, git2::Error> {
     Ok(out)
 }
 
-fn renamed_old_path(
-    repo: &Repository,
-    mode: DiffMode,
+pub fn file_diff(
+    repo_path: &Path,
     file: &str,
-) -> Result<Option<String>, git2::Error> {
-    let mut opts = DiffOptions::new();
-    let mut diff = make_diff(repo, mode, &mut opts)?;
-    let mut find = DiffFindOptions::new();
-    find.renames(true);
-    diff.find_similar(Some(&mut find))?;
-
-    for delta in diff.deltas() {
-        if delta.status() != git2::Delta::Renamed {
-            continue;
-        }
-        let new_p = delta
-            .new_file()
-            .path()
-            .map(|p| p.to_string_lossy().into_owned());
-        if new_p.as_deref() != Some(file) {
-            continue;
-        }
-        let old_p = delta
-            .old_file()
-            .path()
-            .map(|p| p.to_string_lossy().into_owned());
-        return Ok(old_p.filter(|o| o != file));
-    }
-    Ok(None)
-}
-
-pub fn file_diff(repo_path: &Path, file: &str, mode: DiffMode) -> Result<FileDiff, git2::Error> {
+    old: Option<&str>,
+    mode: DiffMode,
+) -> Result<FileDiff, git2::Error> {
     let repo = Repository::open(repo_path)?;
 
     if let Some(d) = conflict_file_diff(&repo, file)? {
         return Ok(d);
     }
 
-    let old = renamed_old_path(&repo, mode, file)?;
+    let old = old.filter(|o| *o != file);
     let scoped = |opts: &mut DiffOptions| {
         opts.pathspec(file);
         if let Some(o) = &old {
@@ -269,6 +245,8 @@ pub fn file_diff(repo_path: &Path, file: &str, mode: DiffMode) -> Result<FileDif
         rows.push(DiffRow::FileHeader(format!("{o}  →  {file}")));
     }
     let mut binary = false;
+    let mut old_no_eol = false;
+    let mut new_no_eol = false;
     let mut block = 0usize;
     for idx in 0..diff.deltas().len() {
         let Some(patch) = Patch::from_diff(&diff, idx)? else {
@@ -292,6 +270,9 @@ pub fn file_diff(repo_path: &Path, file: &str, mode: DiffMode) -> Result<FileDif
                 match line.origin() {
                     '-' => dels.push((line.old_lineno(), text)),
                     '+' => adds.push((line.new_lineno(), text)),
+                    '=' => (old_no_eol, new_no_eol) = (true, true),
+                    '>' => old_no_eol = true,
+                    '<' => new_no_eol = true,
                     _ => {
                         flush_block(&mut rows, &mut dels, &mut adds, &mut block, &headers);
                         rows.push(DiffRow::Line {
@@ -320,9 +301,11 @@ pub fn file_diff(repo_path: &Path, file: &str, mode: DiffMode) -> Result<FileDif
     Ok(FileDiff {
         rows,
         note,
-        conflict: false,
         rename: old.is_some(),
         binary,
+        old_no_eol,
+        new_no_eol,
+        ..FileDiff::empty()
     })
 }
 
@@ -362,10 +345,8 @@ fn conflict_file_diff(repo: &Repository, file: &str) -> Result<Option<FileDiff>,
 
     Ok(Some(FileDiff {
         rows,
-        note: None,
         conflict: true,
-        rename: false,
-        binary: false,
+        ..FileDiff::empty()
     }))
 }
 
@@ -467,9 +448,7 @@ pub fn commit_file_diff(repo_path: &Path, oid: Oid, file: &str) -> Result<FileDi
     Ok(FileDiff {
         rows,
         note,
-        conflict: false,
-        rename: false,
-        binary: false,
+        ..FileDiff::empty()
     })
 }
 
@@ -519,9 +498,7 @@ pub fn commit_diff(repo_path: &Path, oid: Oid) -> Result<FileDiff, git2::Error> 
     Ok(FileDiff {
         rows,
         note,
-        conflict: false,
-        rename: false,
-        binary: false,
+        ..FileDiff::empty()
     })
 }
 
@@ -550,6 +527,7 @@ fn append_patch_rows(
             match line.origin() {
                 '-' => dels.push((line.old_lineno(), text)),
                 '+' => adds.push((line.new_lineno(), text)),
+                '=' | '>' | '<' => {}
                 _ => {
                     flush_pairs(rows, &mut dels, &mut adds);
                     rows.push(DiffRow::Line {
@@ -670,109 +648,134 @@ fn intra_emphasis(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>
     (left, right)
 }
 
-pub fn build_partial_patch(
-    file: &str,
-    rows: &[DiffRow],
+fn partial_contents(
+    diff: &FileDiff,
     lo: usize,
     hi: usize,
-    unstage: bool,
-) -> Option<String> {
-    let mut body = String::new();
-    let mut old_count = 0u32;
-    let mut new_count = 0u32;
+    revert: bool,
+) -> Option<(String, String)> {
+    let (base_no_eol, target_no_eol) = if revert {
+        (diff.new_no_eol, diff.old_no_eol)
+    } else {
+        (diff.old_no_eol, diff.new_no_eol)
+    };
+    let mut base: Vec<&str> = Vec::new();
+    let mut target_len = 0usize;
+    let mut result: Vec<(&str, bool, usize)> = Vec::new();
     let mut changed = false;
 
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in diff.rows.iter().enumerate() {
         let DiffRow::Line {
             left, right, kind, ..
         } = row
         else {
             continue;
         };
-
-        let (base, target): (Option<&str>, Option<&str>) = if !unstage {
-            match kind {
-                LineKind::Context => (left.as_deref(), left.as_deref()),
-                LineKind::Removed => (left.as_deref(), None),
-                LineKind::Added => (None, right.as_deref()),
-                LineKind::Changed => (left.as_deref(), right.as_deref()),
-            }
+        let (b, t) = if revert {
+            (right.as_deref(), left.as_deref())
         } else {
-            match kind {
-                LineKind::Context => (right.as_deref(), right.as_deref()),
-                LineKind::Removed => (None, left.as_deref()),
-                LineKind::Added => (right.as_deref(), None),
-                LineKind::Changed => (right.as_deref(), left.as_deref()),
-            }
+            (left.as_deref(), right.as_deref())
         };
-
-        if *kind == LineKind::Context {
-            if let Some(b) = base {
-                push_line(&mut body, ' ', b);
-                old_count += 1;
-                new_count += 1;
-            }
-            continue;
-        }
-
-        let selected = i >= lo && i <= hi;
+        let selected = *kind != LineKind::Context && (lo..=hi).contains(&i);
         if selected {
-            if let Some(b) = base {
-                push_line(&mut body, '-', b);
-                old_count += 1;
-                changed = true;
+            changed = true;
+            if let Some(t) = t {
+                result.push((t, true, target_len));
             }
-            if let Some(t) = target {
-                push_line(&mut body, '+', t);
-                new_count += 1;
-                changed = true;
-            }
-        } else if let Some(b) = base {
-            push_line(&mut body, ' ', b);
-            old_count += 1;
-            new_count += 1;
+        } else if let Some(b) = b {
+            result.push((b, false, base.len()));
+        }
+        if let Some(b) = b {
+            base.push(b);
+        }
+        if t.is_some() {
+            target_len += 1;
         }
     }
-
     if !changed {
         return None;
     }
 
-    let old_start = if old_count == 0 { 0 } else { 1 };
-    let new_start = if new_count == 0 { 0 } else { 1 };
-    let mut out = format!(
-        "diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n",
-    );
-    out.push_str(&body);
-    Some(out)
+    let last_lacks_eol = match result.last() {
+        Some((_, true, i)) => i + 1 == target_len && target_no_eol,
+        Some((_, false, i)) => i + 1 == base.len() && base_no_eol,
+        None => false,
+    };
+    let lines: Vec<&str> = result.iter().map(|(l, _, _)| *l).collect();
+    Some((
+        join_lines(&base, base_no_eol),
+        join_lines(&lines, last_lacks_eol),
+    ))
 }
 
-fn push_line(body: &mut String, origin: char, text: &str) {
-    body.push(origin);
-    body.push_str(text);
-    body.push('\n');
+fn join_lines(lines: &[&str], no_eol: bool) -> String {
+    let mut out = lines.join("\n");
+    if !lines.is_empty() && !no_eol {
+        out.push('\n');
+    }
+    out
+}
+
+fn ensure_unchanged(current: &[u8], base: &str) -> Result<(), git2::Error> {
+    if current == base.as_bytes() {
+        Ok(())
+    } else {
+        Err(git2::Error::from_str(
+            "file changed since the diff was loaded; try again",
+        ))
+    }
+}
+
+fn entry_mode(repo: &Repository, index: &git2::Index, file: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(file);
+    if let Some(e) = index.get_path(path, 0) {
+        return e.mode;
+    }
+    if let Some(e) = repo
+        .head()
+        .and_then(|h| h.peel_to_tree())
+        .ok()
+        .and_then(|t| t.get_path(path).ok())
+    {
+        return e.filemode() as u32;
+    }
+    let exec = repo
+        .workdir()
+        .and_then(|w| std::fs::metadata(w.join(file)).ok())
+        .is_some_and(|m| m.permissions().mode() & 0o111 != 0);
+    if exec { 0o100755 } else { 0o100644 }
 }
 
 pub fn apply_partial(
     repo_path: &Path,
     file: &str,
-    rows: &[DiffRow],
+    diff: &FileDiff,
     lo: usize,
     hi: usize,
     unstage: bool,
 ) -> Result<(), git2::Error> {
-    let patch = build_partial_patch(file, rows, lo, hi, unstage)
+    let (base, result) = partial_contents(diff, lo, hi, unstage)
         .ok_or_else(|| git2::Error::from_str("no lines selected"))?;
     let repo = Repository::open(repo_path)?;
-    let diff = Diff::from_buffer(patch.as_bytes())?;
-    let mut opts = ApplyOptions::new();
-    repo.apply(&diff, ApplyLocation::Index, Some(&mut opts))
+    let mut index = repo.index()?;
+    let current = match index.get_path(Path::new(file), 0) {
+        Some(e) => repo.find_blob(e.id)?.content().to_vec(),
+        None => Vec::new(),
+    };
+    ensure_unchanged(&current, &base)?;
+    let mode = entry_mode(&repo, &index, file);
+    index.add_frombuffer(
+        &super::ops::index_entry(file, Oid::ZERO_SHA1, mode),
+        result.as_bytes(),
+    )?;
+    index.write()
 }
 
 pub fn discard_partial(
     repo_path: &Path,
     file: &str,
-    rows: &[DiffRow],
+    diff: &FileDiff,
     lo: usize,
     hi: usize,
 ) -> Result<(), git2::Error> {
@@ -780,11 +783,20 @@ pub fn discard_partial(
     if super::ops::reset_submodule_pointer(&repo, file)? {
         return Ok(());
     }
-    let patch = build_partial_patch(file, rows, lo, hi, true)
+    let (base, result) = partial_contents(diff, lo, hi, true)
         .ok_or_else(|| git2::Error::from_str("no lines selected"))?;
-    let diff = Diff::from_buffer(patch.as_bytes())?;
-    let mut opts = ApplyOptions::new();
-    repo.apply(&diff, ApplyLocation::WorkDir, Some(&mut opts))
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| git2::Error::from_str("bare repository"))?;
+    let abs = workdir.join(file);
+    let io_err = |e: std::io::Error| git2::Error::from_str(&format!("{file}: {e}"));
+    let current = match std::fs::read(&abs) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(io_err(e)),
+    };
+    ensure_unchanged(&current, &base)?;
+    std::fs::write(&abs, result).map_err(io_err)
 }
 
 #[cfg(test)]

@@ -104,8 +104,7 @@ impl TuiApp {
     }
 
     pub(super) fn open_amend_prompt(&mut self) {
-        if repo::seq_state(&self.selected) != repo::SeqState::None {
-            self.error = Some("finish or abort the in-progress operation first".to_string());
+        if self.busy_with_seq() {
             return;
         }
         if !repo::head_has_commit(&self.selected) {
@@ -140,7 +139,7 @@ impl TuiApp {
     }
 
     pub(super) fn run_discard_lines(&mut self, path: &str, lo: usize, hi: usize) {
-        if let Err(e) = repo::discard_partial(&self.selected, path, &self.diff.rows, lo, hi) {
+        if let Err(e) = repo::discard_partial(&self.selected, path, &self.diff, lo, hi) {
             self.error = Some(format!("discard failed: {e}"));
         } else {
             self.error = None;

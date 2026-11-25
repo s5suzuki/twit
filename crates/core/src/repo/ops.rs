@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use git2::{
-    ApplyLocation, ApplyOptions, Cred, CredentialType, Diff, DiffOptions, ErrorCode, FetchOptions,
-    Index, IndexAddOption, Oid, PushOptions, Rebase, RemoteCallbacks, Repository, RepositoryState,
-    Signature, Submodule, SubmoduleUpdateOptions,
+    Cred, CredentialType, ErrorCode, FetchOptions, Index, IndexAddOption, Oid, PushOptions, Rebase,
+    RemoteCallbacks, Repository, RepositoryState, Signature, StatusOptions, Submodule,
+    SubmoduleUpdateOptions,
 };
 
 use super::gitconfig;
@@ -57,7 +57,7 @@ fn stage_conflicted_submodules<'a>(
     Ok(rest)
 }
 
-fn index_entry(path: &str, id: Oid, mode: u32) -> git2::IndexEntry {
+pub(crate) fn index_entry(path: &str, id: Oid, mode: u32) -> git2::IndexEntry {
     git2::IndexEntry {
         ctime: git2::IndexTime::new(0, 0),
         mtime: git2::IndexTime::new(0, 0),
@@ -101,37 +101,6 @@ pub fn unstage(repo_path: &Path, paths: &[String]) -> Result<(), git2::Error> {
             index.write()
         }
     }
-}
-
-pub fn stage_hunk(repo_path: &Path, file: &str, hunk_index: usize) -> Result<(), git2::Error> {
-    let repo = Repository::open(repo_path)?;
-    let mut opts = DiffOptions::new();
-    opts.pathspec(file);
-    opts.context_lines(0);
-    let diff = repo.diff_index_to_workdir(None, Some(&mut opts))?;
-    apply_nth_hunk(&repo, &diff, hunk_index)
-}
-
-pub fn unstage_hunk(repo_path: &Path, file: &str, hunk_index: usize) -> Result<(), git2::Error> {
-    let repo = Repository::open(repo_path)?;
-    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-    let mut opts = DiffOptions::new();
-    opts.pathspec(file);
-    opts.context_lines(0);
-    opts.reverse(true);
-    let diff = repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?;
-    apply_nth_hunk(&repo, &diff, hunk_index)
-}
-
-fn apply_nth_hunk(repo: &Repository, diff: &Diff, target: usize) -> Result<(), git2::Error> {
-    let mut counter = 0usize;
-    let mut opts = ApplyOptions::new();
-    opts.hunk_callback(|_hunk| {
-        let take = counter == target;
-        counter += 1;
-        take
-    });
-    repo.apply(diff, ApplyLocation::Index, Some(&mut opts))
 }
 
 pub fn discard(repo_path: &Path, paths: &[String]) -> Result<(), git2::Error> {
@@ -313,6 +282,7 @@ pub fn cherry_pick(repo_path: &Path, oid: Oid) -> Result<SeqOutcome, git2::Error
     if commit.parent_count() > 1 {
         opts.mainline(1);
     }
+    ensure_clean(&repo)?;
     repo.cherrypick(&commit, Some(&mut opts))?;
     finish_cherry_pick(&repo, &commit)
 }
@@ -344,6 +314,7 @@ pub fn revert(repo_path: &Path, oid: Oid) -> Result<SeqOutcome, git2::Error> {
     if commit.parent_count() > 1 {
         opts.mainline(1);
     }
+    ensure_clean(&repo)?;
     repo.revert(&commit, Some(&mut opts))?;
     finish_revert(&repo, &commit)
 }
@@ -377,6 +348,18 @@ fn finish_revert(repo: &Repository, reverted: &git2::Commit) -> Result<SeqOutcom
     repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&head])?;
     repo.cleanup_state()?;
     Ok(SeqOutcome::Done)
+}
+
+fn ensure_clean(repo: &Repository) -> Result<(), git2::Error> {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false).exclude_submodules(true);
+    if repo.statuses(Some(&mut opts))?.is_empty() {
+        Ok(())
+    } else {
+        Err(git2::Error::from_str(
+            "uncommitted changes; commit or stash them first",
+        ))
+    }
 }
 
 fn reset_hard_to_head(repo_path: &Path) -> Result<(), git2::Error> {
@@ -427,6 +410,7 @@ pub fn merge(repo_path: &Path, oid: Oid, label: &str) -> Result<SeqOutcome, git2
         return Ok(SeqOutcome::Done);
     }
 
+    ensure_clean(&repo)?;
     repo.merge(&[&annotated], None, None)?;
     let mut index = repo.index()?;
     if index.has_conflicts() {
@@ -667,6 +651,11 @@ pub(crate) fn conflict_paths(index: &Index) -> Vec<String> {
 
 pub fn commit(repo_path: &Path, message: &str) -> Result<(), git2::Error> {
     let repo = Repository::open(repo_path)?;
+    if repo.state() != RepositoryState::Clean {
+        return Err(git2::Error::from_str(
+            "an operation is in progress; continue or abort it first",
+        ));
+    }
     let sig = gitconfig::signature(&repo)?;
 
     let mut index = repo.index()?;
@@ -812,10 +801,17 @@ fn helper_cred(dir: &Path, url: &str, username: Option<&str>) -> Option<(String,
 fn credentials_cb(
     dir: PathBuf,
 ) -> impl FnMut(&str, Option<&str>, CredentialType) -> Result<Cred, git2::Error> {
+    let mut tried = false;
     move |url, username, allowed| {
         if allowed.contains(CredentialType::USERNAME) {
             return Cred::username(username.unwrap_or("git"));
         }
+        if tried {
+            return Err(git2::Error::from_str(&format!(
+                "authentication failed for {url}"
+            )));
+        }
+        tried = true;
         if allowed.contains(CredentialType::SSH_KEY) {
             return Cred::ssh_key_from_agent(username.unwrap_or("git"));
         }
@@ -904,54 +900,28 @@ pub fn delete_remote_branch<F: FnMut(usize, usize)>(
 pub fn pull<F: FnMut(usize, usize)>(
     repo_path: &Path,
     remote_name: &str,
-    mut progress: F,
+    progress: F,
 ) -> Result<SeqOutcome, git2::Error> {
+    fetch(repo_path, remote_name, progress)?;
     let repo = Repository::open(repo_path)?;
-    {
-        let mut cbs = RemoteCallbacks::new();
-        cbs.credentials(credentials_cb(credential_dir(&repo)));
-        cbs.transfer_progress(|stats| {
-            progress(stats.received_objects(), stats.total_objects());
-            true
-        });
-        let mut opts = FetchOptions::new();
-        opts.remote_callbacks(cbs);
-        let mut remote = repo.find_remote(remote_name)?;
-        remote.fetch(&[] as &[&str], Some(&mut opts), None)?;
+    let head = repo.head()?;
+    if !head.is_branch() {
+        return Err(git2::Error::from_str("not on a branch"));
     }
-
-    let fetch_head = repo.find_reference("FETCH_HEAD")?;
-    let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
-    let analysis = repo.merge_analysis(&[&fetch_commit])?.0;
-
-    if analysis.is_up_to_date() {
-        return Ok(SeqOutcome::Done);
-    }
-
-    if analysis.is_fast_forward() {
-        let obj = repo.find_object(fetch_commit.id(), None)?;
-        repo.checkout_tree(&obj, Some(git2::build::CheckoutBuilder::new().safe()))?;
-        let refname = repo.head()?.name().map(String::from)?;
-        repo.find_reference(&refname)?
-            .set_target(fetch_commit.id(), "pull: fast-forward")?;
-        return Ok(SeqOutcome::Done);
-    }
-
-    repo.merge(&[&fetch_commit], None, None)?;
-    let mut index = repo.index()?;
-    if index.has_conflicts() {
-        return Ok(SeqOutcome::Conflicts(conflict_paths(&index)));
-    }
-    let tree = repo.find_tree(index.write_tree()?)?;
-    let head = repo.head()?.peel_to_commit()?;
-    let their = repo.find_commit(fetch_commit.id())?;
-    let sig = gitconfig::signature(&repo)?;
-    let msg = repo
-        .message()
-        .unwrap_or_else(|_| format!("Merge commit '{}'", fetch_commit.id()));
-    repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&head, &their])?;
-    repo.cleanup_state()?;
-    Ok(SeqOutcome::Done)
+    let name = head.shorthand()?.to_string();
+    let upstream = repo
+        .find_branch(&name, git2::BranchType::Local)?
+        .upstream()
+        .map_err(|_| git2::Error::from_str(&format!("branch '{name}' has no upstream")))?;
+    let oid = upstream
+        .get()
+        .target()
+        .ok_or_else(|| git2::Error::from_str("upstream has no target"))?;
+    let label = format!(
+        "remote-tracking branch '{}'",
+        upstream.name()?.unwrap_or("")
+    );
+    merge(repo_path, oid, &label)
 }
 
 pub fn checkout_tracking(repo_path: &Path, remote_ref: &str) -> Result<(), git2::Error> {
@@ -979,7 +949,8 @@ pub fn checkout_tracking(repo_path: &Path, remote_ref: &str) -> Result<(), git2:
 
 #[cfg(test)]
 mod tests {
-    use super::helper_cred;
+    use super::{credentials_cb, helper_cred};
+    use git2::CredentialType;
     use std::process::Command;
 
     fn git(dir: &std::path::Path, args: &[&str]) {
@@ -1027,5 +998,16 @@ mod tests {
         let got = helper_cred(&tmp, "https://example.invalid/acme/x.git", None);
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(got, Some(("u".to_string(), "secret".to_string())));
+    }
+
+    #[test]
+    fn rejected_credentials_are_not_offered_again() {
+        let mut cb = credentials_cb(std::env::temp_dir());
+        let url = "ssh://git@example.invalid/x.git";
+        assert!(cb(url, Some("git"), CredentialType::USERNAME).is_ok());
+        assert!(cb(url, Some("git"), CredentialType::SSH_KEY).is_ok());
+        assert!(cb(url, Some("git"), CredentialType::USERNAME).is_ok());
+        let err = cb(url, Some("git"), CredentialType::SSH_KEY).err().unwrap();
+        assert!(err.message().contains("authentication failed"), "{err}");
     }
 }

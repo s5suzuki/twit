@@ -135,7 +135,9 @@ impl TuiApp {
             }
         }
         if self.focus == Pane::Changes && queue.take(Modifiers::NONE, Key::C) {
-            self.open_prompt(Prompt::Commit);
+            if !self.busy_with_seq() {
+                self.open_prompt(Prompt::Commit);
+            }
             return;
         }
         if self.focus == Pane::Changes && queue.take(Modifiers::NONE, Key::A) {

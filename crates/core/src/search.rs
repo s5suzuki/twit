@@ -46,27 +46,18 @@ impl SearchFilter {
 
 pub struct Matcher {
     re: Regex,
-    literal_replace: bool,
 }
 
 impl Matcher {
-    pub fn new(pattern: &str, regex: bool, case_sensitive: bool) -> Result<Matcher, String> {
+    pub fn new(pattern: &str) -> Result<Matcher, String> {
         if pattern.is_empty() {
             return Err("empty pattern".to_string());
         }
-        let pat = if regex {
-            pattern.to_string()
-        } else {
-            regex::escape(pattern)
-        };
-        let re = RegexBuilder::new(&pat)
-            .case_insensitive(!case_sensitive)
+        let re = RegexBuilder::new(&regex::escape(pattern))
+            .case_insensitive(true)
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Matcher {
-            re,
-            literal_replace: !regex,
-        })
+        Ok(Matcher { re })
     }
 }
 
@@ -79,15 +70,6 @@ pub struct LineHit {
 pub struct FileHit {
     pub path: String,
     pub lines: Vec<LineHit>,
-}
-
-pub fn line_ranges(matcher: &Matcher, line: &str) -> Vec<(usize, usize)> {
-    matcher
-        .re
-        .find_iter(line)
-        .filter(|m| m.start() != m.end())
-        .map(|m| (m.start(), m.end()))
-        .collect()
 }
 
 pub fn search_text(matcher: &Matcher, text: &str) -> Vec<LineHit> {
@@ -122,81 +104,47 @@ pub fn replace_all_in_text(matcher: &Matcher, text: &str, replacement: &str) -> 
             .find_iter(seg)
             .filter(|m| m.start() != m.end())
             .count();
-        let replaced = if matcher.literal_replace {
-            matcher.re.replace_all(seg, regex::NoExpand(replacement))
-        } else {
-            matcher.re.replace_all(seg, replacement)
-        };
-        out.push_str(&replaced);
+        out.push_str(&matcher.re.replace_all(seg, regex::NoExpand(replacement)));
     }
     (out, count)
 }
 
-pub fn replace_line_in_text(
-    matcher: &Matcher,
-    text: &str,
-    line_no: u32,
-    replacement: &str,
-) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut changed = false;
-    for (i, seg) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if (i + 1) as u32 == line_no {
-            let replaced = if matcher.literal_replace {
-                matcher.re.replace_all(seg, regex::NoExpand(replacement))
-            } else {
-                matcher.re.replace_all(seg, replacement)
-            };
-            if replaced != seg {
-                changed = true;
-            }
-            out.push_str(&replaced);
-        } else {
-            out.push_str(seg);
-        }
-    }
-    changed.then_some(out)
+pub struct ReplaceReport {
+    pub files: usize,
+    pub matches: usize,
+    pub failed: Vec<String>,
 }
 
-pub fn replace_one_in_text(
+pub fn replace_in_files(
+    root: &Path,
+    paths: &[&str],
     matcher: &Matcher,
-    text: &str,
-    line_no: u32,
-    start: usize,
     replacement: &str,
-) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut changed = false;
-    for (i, seg) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if (i + 1) as u32 == line_no
-            && let Some(caps) = matcher
-                .re
-                .captures_iter(seg)
-                .find(|c| c.get(0).map(|m| m.start()) == Some(start))
-        {
-            let m = caps.get(0).unwrap();
-            let rep = if matcher.literal_replace {
-                replacement.to_string()
-            } else {
-                let mut s = String::new();
-                caps.expand(replacement, &mut s);
-                s
-            };
-            out.push_str(&seg[..m.start()]);
-            out.push_str(&rep);
-            out.push_str(&seg[m.end()..]);
-            changed = true;
-        } else {
-            out.push_str(seg);
+) -> ReplaceReport {
+    let mut report = ReplaceReport {
+        files: 0,
+        matches: 0,
+        failed: Vec::new(),
+    };
+    for path in paths {
+        let abs = root.join(path);
+        let result = std::fs::read_to_string(&abs).and_then(|text| {
+            let (new_text, n) = replace_all_in_text(matcher, &text, replacement);
+            if n > 0 {
+                std::fs::write(&abs, new_text)?;
+            }
+            Ok(n)
+        });
+        match result {
+            Ok(0) => {}
+            Ok(n) => {
+                report.files += 1;
+                report.matches += n;
+            }
+            Err(e) => report.failed.push(format!("{path}: {e}")),
         }
     }
-    changed.then_some(out)
+    report
 }
 
 fn readable_text(path: &Path) -> Option<String> {
@@ -205,10 +153,6 @@ fn readable_text(path: &Path) -> Option<String> {
         return None;
     }
     String::from_utf8(bytes).ok()
-}
-
-pub fn search_repo(root: &Path, matcher: &Matcher, filter: &SearchFilter) -> Vec<FileHit> {
-    search_repo_filtered(root, matcher, filter).unwrap_or_default()
 }
 
 pub fn search_repo_filtered(
@@ -251,7 +195,7 @@ mod tests {
 
     #[test]
     fn literal_search_and_replace() {
-        let m = Matcher::new("foo", false, true).unwrap();
+        let m = Matcher::new("foo").unwrap();
         let hits = search_text(&m, "foo bar\nno match\nfoo foo");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].line_no, 1);
@@ -264,38 +208,22 @@ mod tests {
 
     #[test]
     fn case_insensitive() {
-        let m = Matcher::new("foo", false, false).unwrap();
+        let m = Matcher::new("foo").unwrap();
         let hits = search_text(&m, "FOO Foo foo");
         assert_eq!(hits[0].ranges.len(), 3);
     }
 
     #[test]
-    fn regex_capture_replace() {
-        let m = Matcher::new(r"(\w+)=(\d+)", true, true).unwrap();
-        let (new, n) = replace_all_in_text(&m, "a=1 b=22", "$2:$1");
-        assert_eq!(new, "1:a 22:b");
-        assert_eq!(n, 2);
-    }
-
-    #[test]
     fn literal_replace_keeps_dollar() {
-        let m = Matcher::new("x", false, true).unwrap();
+        let m = Matcher::new("x").unwrap();
         let (new, _) = replace_all_in_text(&m, "x", "$1");
         assert_eq!(new, "$1");
     }
 
     #[test]
-    fn replace_one_targets_single_occurrence() {
-        let m = Matcher::new("a", false, true).unwrap();
-        let text = "a a a";
-        let new = replace_one_in_text(&m, text, 1, 2, "Z").unwrap();
-        assert_eq!(new, "a Z a");
-    }
-
-    #[test]
     fn empty_pattern_errors() {
-        assert!(Matcher::new("", false, true).is_err());
-        assert!(Matcher::new("(", true, true).is_err());
+        assert!(Matcher::new("").is_err());
+        assert!(Matcher::new("(").is_ok());
     }
 
     #[test]
@@ -317,7 +245,7 @@ mod tests {
 
     #[test]
     fn preserves_trailing_newline() {
-        let m = Matcher::new("a", false, true).unwrap();
+        let m = Matcher::new("a").unwrap();
         let (new, _) = replace_all_in_text(&m, "a\n", "b");
         assert_eq!(new, "b\n");
     }

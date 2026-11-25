@@ -181,7 +181,7 @@ impl TuiApp {
             self.search.hits.clear();
             return;
         }
-        let m = match twit_core::search::Matcher::new(query, false, false) {
+        let m = match twit_core::search::Matcher::new(query) {
             Ok(m) => m,
             Err(e) => {
                 self.error = Some(format!("search failed: {e}"));
@@ -200,28 +200,24 @@ impl TuiApp {
     }
 
     pub(super) fn run_search_replace(&mut self, replacement: &str) {
-        let matcher = match twit_core::search::Matcher::new(&self.search.query, false, false) {
+        let matcher = match twit_core::search::Matcher::new(&self.search.query) {
             Ok(m) => m,
             Err(e) => {
                 self.error = Some(format!("replace failed: {e}"));
                 return;
             }
         };
-        let mut files = 0usize;
-        let mut count = 0usize;
-        for hit in &self.search.hits {
-            let abs = self.selected.join(&hit.path);
-            let Ok(text) = std::fs::read_to_string(&abs) else {
-                continue;
-            };
-            let (new_text, n) =
-                twit_core::search::replace_all_in_text(&matcher, &text, replacement);
-            if n > 0 && std::fs::write(&abs, new_text).is_ok() {
-                files += 1;
-                count += n;
-            }
+        let paths: Vec<&str> = self.search.hits.iter().map(|h| h.path.as_str()).collect();
+        let report =
+            twit_core::search::replace_in_files(&self.selected, &paths, &matcher, replacement);
+        let mut msg = format!(
+            "replaced {} matches in {} files",
+            report.matches, report.files
+        );
+        if !report.failed.is_empty() {
+            msg.push_str(&format!("; failed: {}", report.failed.join(", ")));
         }
-        self.error = Some(format!("replaced {count} matches in {files} files"));
+        self.error = Some(msg);
         let query = self.search.query.clone();
         self.run_search(&query);
         self.refresh();

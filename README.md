@@ -7,7 +7,7 @@ A lightweight terminal Git client for Linux, inspired by VS Code's *Git Graph* e
 - **Commit graph**
 - **Two-stage staging**
 - **Side-by-side diff**
-- **Regex search & replace**
+- **Search & replace**
 - **Per-submodule scoping**
 - **Neovim integration**
 - **Embedded terminal / Neovim**

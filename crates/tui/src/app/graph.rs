@@ -121,7 +121,12 @@ impl TuiApp {
     pub(super) fn open_commit_file_diff(&mut self, oid: Oid, path: String) {
         let result = if oid.is_zero() {
             let staged = self.worktree_file_staged(&path);
-            repo::file_diff(&self.selected, &path, diff_mode(staged))
+            repo::file_diff(
+                &self.selected,
+                &path,
+                self.status_old_path(&path, staged).as_deref(),
+                diff_mode(staged),
+            )
         } else {
             repo::commit_file_diff(&self.selected, oid, &path)
         };

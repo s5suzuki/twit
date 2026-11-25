@@ -635,17 +635,8 @@ fn intra_emphasis(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>
         return (Vec::new(), Vec::new());
     }
 
-    let left = if p < old_end {
-        vec![p..old_end]
-    } else {
-        Vec::new()
-    };
-    let right = if p < new_end {
-        vec![p..new_end]
-    } else {
-        Vec::new()
-    };
-    (left, right)
+    let nonempty = |r: Range<usize>| Some(r).filter(|r| !r.is_empty()).into_iter().collect();
+    (nonempty(p..old_end), nonempty(p..new_end))
 }
 
 fn partial_contents(

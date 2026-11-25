@@ -223,10 +223,10 @@ mod tests {
             for line in info.lines() {
                 if let Some(rest) = line.strip_prefix("inotify ") {
                     for tok in rest.split_whitespace() {
-                        if let Some(hex) = tok.strip_prefix("ino:") {
-                            if let Ok(ino) = u64::from_str_radix(hex, 16) {
-                                inodes.insert(ino);
-                            }
+                        if let Some(hex) = tok.strip_prefix("ino:")
+                            && let Ok(ino) = u64::from_str_radix(hex, 16)
+                        {
+                            inodes.insert(ino);
                         }
                     }
                 }

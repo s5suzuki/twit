@@ -416,8 +416,8 @@ impl TextInput {
                 'r' => self.awaiting = Awaiting::Replace,
                 '~' => {
                     self.mark_change();
-                    for i in lo..hi {
-                        self.chars[i] = toggle_case(self.chars[i]);
+                    for ch in &mut self.chars[lo..hi] {
+                        *ch = toggle_case(*ch);
                     }
                     self.cursor = lo;
                     self.mode = InputMode::Normal;
@@ -685,9 +685,7 @@ impl TextInput {
     fn replace_chars(&mut self, c: char) {
         if let Some((lo, hi)) = self.selection() {
             self.mark_change();
-            for i in lo..hi {
-                self.chars[i] = c;
-            }
+            self.chars[lo..hi].fill(c);
             self.cursor = lo;
             self.mode = InputMode::Normal;
             self.clamp_normal();

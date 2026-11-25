@@ -345,19 +345,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::civil_from_days;
-
-    #[test]
-    fn civil_from_days_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(18_993), (2022, 1, 1));
-        assert_eq!(civil_from_days(20_634), (2026, 6, 30));
-        assert_eq!(civil_from_days(-1), (1969, 12, 31));
-    }
-}
-
 fn first_free(active: &[Option<Lane>]) -> usize {
     active
         .iter()
@@ -368,5 +355,18 @@ fn first_free(active: &[Option<Lane>]) -> usize {
 fn ensure_len(active: &mut Vec<Option<Lane>>, len: usize) {
     if active.len() < len {
         active.resize_with(len, || None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::civil_from_days;
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(18_993), (2022, 1, 1));
+        assert_eq!(civil_from_days(20_634), (2026, 6, 30));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 }

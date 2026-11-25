@@ -72,7 +72,7 @@ fn section(lines: &mut Vec<Line<'static>>, app: &TuiApp, ctx: Context, width: us
         Style::default().add_modifier(Modifier::BOLD),
     );
     for e in app.keymap.help_for(ctx) {
-        push_kv(lines, width, &e.keys, &e.desc);
+        push_kv(lines, width, &e.keys, e.desc);
     }
     lines.push(Line::raw(""));
 }

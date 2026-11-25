@@ -81,6 +81,7 @@ pub fn state_gone_or_quit(dir: &Path) -> bool {
 fn lock_dir(dir: &Path) -> Option<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(dir.join("lock"))
         .ok()?;

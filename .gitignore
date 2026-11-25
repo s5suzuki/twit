@@ -1,0 +1,6 @@
+/target
+target/
+*.md
+*.sh
+!README.md
+!CHANGELOG.md

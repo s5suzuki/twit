@@ -1,0 +1,23 @@
+layout {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+    pane split_direction="vertical" {
+        pane size=26 command="twit" name="repositories" {
+            args "--view" "sidebar"
+            close_on_exit true
+        }
+        pane size=36 command="twit" name="changes" {
+            args "--view" "changes"
+            close_on_exit true
+        }
+        pane command="twit" name="graph | diff" {
+            args "--view" "main"
+            close_on_exit true
+        }
+    }
+    pane size=2 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}
+

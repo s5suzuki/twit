@@ -1,0 +1,1487 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use twit::app::{Pane, Tab, TuiApp};
+use twit::ui;
+
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .expect("git runs");
+    assert!(status.status.success(), "git {args:?} failed");
+}
+
+fn temp_repo() -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("twit-test-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["config", "user.name", "t"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    dir
+}
+
+fn screen(app: &mut TuiApp, w: u16, h: u16) -> Vec<String> {
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..h)
+        .map(|y| {
+            let mut line = String::new();
+            let mut skip = 0usize;
+            for x in 0..w {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                if let Some(cell) = buffer.cell((x, y)) {
+                    let sym = cell.symbol();
+                    line.push_str(sym);
+                    skip = unicode_width::UnicodeWidthStr::width(sym).saturating_sub(1);
+                }
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn find_line<'a>(lines: &'a [String], needle: &str) -> Option<&'a String> {
+    lines.iter().find(|l| l.contains(needle))
+}
+
+#[test]
+fn changes_and_side_by_side_diff_render_with_cjk() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("hello.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(
+        dir.join("hello.rs"),
+        "fn main() {\n    let x = 2; // 日本語コメント\n}\n",
+    )
+    .unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Changes (1)").is_some());
+    assert!(find_line(&lines, "M hello.rs").is_some());
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+    assert_eq!(app.active_tab, Tab::Diff);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "@@").is_some(), "hunk header shown");
+    let changed = find_line(&lines, "日本語コメント").expect("changed line rendered");
+    assert!(
+        changed.contains("let x = 1;"),
+        "old content on the left of the same row: {changed}"
+    );
+    let no_line = find_line(&lines, "2 ").expect("line numbers");
+    assert!(!no_line.is_empty());
+}
+
+#[test]
+fn graph_renders_merge_topology_with_connectors() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    git(&dir, &["checkout", "-qb", "feature"]);
+    std::fs::write(dir.join("f.txt"), "f\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "feature work"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    std::fs::write(dir.join("m.txt"), "m\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "main work"]);
+    git(
+        &dir,
+        &["merge", "-q", "--no-ff", "feature", "-m", "merge feature"],
+    );
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    let lines = screen(&mut app, 140, 30);
+
+    let merge = find_line(&lines, "merge feature").expect("merge row");
+    assert!(merge.contains("●─╮"), "merge branches out: {merge}");
+    let feature = find_line(&lines, "feature work").expect("feature row");
+    assert!(feature.contains("│ ●"), "feature on lane 1: {feature}");
+    let init = find_line(&lines, "init").expect("init row");
+    assert!(init.contains("●─╯"), "feature lane merges back: {init}");
+
+    let merge_idx = lines
+        .iter()
+        .position(|l| l.contains("merge feature"))
+        .unwrap();
+    let connector = &lines[merge_idx + 1];
+    assert!(
+        connector.trim_start().starts_with("│"),
+        "connector row between commits: {connector:?}"
+    );
+}
+
+#[test]
+fn graph_shows_author_name_and_email() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.config.graph_show_author = true;
+    app.config.graph_show_email = true;
+    let lines = screen(&mut app, 140, 30);
+    let init = find_line(&lines, "init").expect("init row");
+    assert!(init.contains("t  <t@t>"), "author and email shown: {init}");
+
+    app.config.graph_show_email = false;
+    let lines = screen(&mut app, 140, 30);
+    let init = find_line(&lines, "init").expect("init row");
+    assert!(!init.contains("<t@t>"), "email hidden when off: {init}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn visual_select_and_yank_sets_pending_copy() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("x.txt"), "one\ntwo\nthree\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("x.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+    assert_eq!(app.active_tab, Tab::Diff);
+    let _ = screen(&mut app, 120, 30);
+
+    app.handle_input(vec![
+        key(KeyCode::Char('v')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('y')),
+    ]);
+    let copied = app.pending_copy.take().expect("yank stored");
+    assert!(copied.contains("TWO"), "copied selection: {copied:?}");
+    assert!(app.diff_nav.anchor.is_none(), "visual cleared after yank");
+}
+
+#[test]
+fn nav_history_back_and_forward_between_file_diffs() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "a2\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b2\n").unwrap();
+
+    let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+    app.track_nav();
+    assert_eq!(
+        app.selected_file.as_ref().map(|(p, _)| p.as_str()),
+        Some("a.txt")
+    );
+
+    app.handle_input(vec![alt('h'), key(KeyCode::Char('j')), key(KeyCode::Enter)]);
+    app.track_nav();
+    assert_eq!(
+        app.selected_file.as_ref().map(|(p, _)| p.as_str()),
+        Some("b.txt")
+    );
+
+    app.handle_input(vec![ctrl('o')]);
+    app.track_nav();
+    assert_eq!(
+        app.selected_file.as_ref().map(|(p, _)| p.as_str()),
+        Some("a.txt"),
+        "ctrl+o returns to the previously viewed diff"
+    );
+
+    app.handle_input(vec![ctrl('i')]);
+    app.track_nav();
+    assert_eq!(
+        app.selected_file.as_ref().map(|(p, _)| p.as_str()),
+        Some("b.txt"),
+        "ctrl+i moves forward again"
+    );
+
+    app.handle_input(vec![ctrl('i')]);
+    app.track_nav();
+    assert_eq!(
+        app.selected_file.as_ref().map(|(p, _)| p.as_str()),
+        Some("b.txt"),
+        "forward at the end is a no-op"
+    );
+}
+
+#[test]
+fn nav_back_from_first_opened_diff_returns_to_changes() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "a2\n").unwrap();
+
+    let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    assert_eq!(app.focus, Pane::Changes);
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('l')),
+    ]);
+    app.track_nav();
+    assert_eq!(app.active_tab, Tab::Diff);
+    assert_eq!(app.focus, Pane::RightTab, "l on a file moves into the diff");
+
+    app.handle_input(vec![ctrl('o')]);
+    app.track_nav();
+    assert_eq!(
+        app.focus,
+        Pane::Changes,
+        "ctrl+o after opening the first diff returns focus to changes"
+    );
+}
+
+#[test]
+fn stage_via_space_and_commit_updates_graph() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Char(' '))]);
+    assert_eq!(
+        app.staged.len(),
+        1,
+        "space on the Changes group stages all files"
+    );
+
+    app.handle_input(vec![key(KeyCode::Char('c'))]);
+    assert!(app.prompt.is_some(), "c opens commit prompt");
+    for ch in "test commit".chars() {
+        app.handle_input(vec![key(KeyCode::Char(ch))]);
+    }
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(app.prompt.is_none());
+    assert!(app.staged.is_empty(), "staged consumed by commit");
+    let mut found = false;
+    let lines = screen(&mut app, 140, 30);
+    for l in &lines {
+        if l.contains("test commit") {
+            found = true;
+        }
+    }
+    assert!(found, "new commit appears in graph");
+}
+
+#[test]
+fn commit_prompt_renders_as_centered_popup() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.config.vim_input = false;
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Char(' '))]);
+    app.handle_input(vec![key(KeyCode::Char('c'))]);
+    for ch in "my message".chars() {
+        app.handle_input(vec![key(KeyCode::Char(ch))]);
+    }
+
+    let lines = screen(&mut app, 60, 24);
+    let label_row = lines
+        .iter()
+        .position(|l| l.contains("Commit message:"))
+        .expect("popup shows the label");
+    assert!(
+        label_row > 0 && label_row < lines.len() - 1,
+        "label is inside a boxed popup, not on the bottom bar (row {label_row})"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("my message")),
+        "typed message is visible in the popup"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("Esc: cancel")),
+        "popup shows the cancel hint"
+    );
+
+    app.handle_input(vec![key(KeyCode::Esc)]);
+    assert!(app.prompt.is_none(), "esc cancels when vim input is off");
+}
+
+#[test]
+fn prompt_edits_at_the_cursor_and_takes_vim_commands() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.config.vim_input = true;
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Char(' '))]);
+    app.handle_input(vec![key(KeyCode::Char('c'))]);
+    type_text(&mut app, "fix thing");
+
+    for _ in 0..5 {
+        app.handle_input(vec![key(KeyCode::Left)]);
+    }
+    type_text(&mut app, "the ");
+    assert_eq!(prompt_text(&app), "fix the thing", "insert at the cursor");
+
+    app.handle_input(vec![key(KeyCode::Home), key(KeyCode::Delete)]);
+    assert_eq!(prompt_text(&app), "ix the thing", "home and delete");
+
+    app.handle_input(vec![key(KeyCode::Esc)]);
+    let lines = screen(&mut app, 60, 24);
+    assert!(
+        lines.iter().any(|l| l.contains("-- NORMAL --")),
+        "esc switches to normal mode"
+    );
+
+    type_text(&mut app, "dw");
+    assert_eq!(prompt_text(&app), "the thing", "dw deletes a word");
+    type_text(&mut app, "A!");
+    assert_eq!(prompt_text(&app), "the thing!", "A appends at the end");
+
+    app.handle_input(vec![key(KeyCode::Esc)]);
+    assert!(
+        app.prompt.is_some(),
+        "esc leaves insert mode, not the prompt"
+    );
+    app.handle_input(vec![key(KeyCode::Esc)]);
+    assert!(
+        app.prompt.is_none(),
+        "esc in normal mode cancels the prompt"
+    );
+}
+
+fn prompt_text(app: &TuiApp) -> String {
+    app.prompt
+        .as_ref()
+        .map(|(_, input)| input.text())
+        .unwrap_or_default()
+}
+
+fn type_text(app: &mut TuiApp, text: &str) {
+    for ch in text.chars() {
+        app.handle_input(vec![key(KeyCode::Char(ch))]);
+    }
+}
+
+#[test]
+fn amend_prompt_prefills_head_message_and_rewrites_commit() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "first"]);
+    std::fs::write(dir.join("a.txt"), "b\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char(' ')),
+    ]);
+    assert_eq!(app.staged.len(), 1);
+
+    app.handle_input(vec![key(KeyCode::Char('a'))]);
+    let (_, input) = app.prompt.as_ref().expect("a opens amend prompt");
+    assert_eq!(input.text(), "first", "prompt prefilled with head message");
+
+    type_text(&mut app, " v2");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(app.prompt.is_none(), "unpushed head amends without confirm");
+    assert!(app.staged.is_empty(), "staged changes folded into head");
+    let commits = app.graph.rows.iter().filter(|r| !r.is_uncommitted).count();
+    assert_eq!(commits, 1, "amend must not add a commit");
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "first v2").is_some(),
+        "graph shows amended message"
+    );
+}
+
+#[test]
+fn discard_file_asks_confirmation_before_restoring() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('d')),
+    ]);
+    assert!(app.prompt.is_some(), "d asks for confirmation");
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Discard changes to a.txt?").is_some());
+
+    app.handle_input(vec![key(KeyCode::Char('n'))]);
+    assert!(app.prompt.is_none());
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n");
+
+    app.handle_input(vec![key(KeyCode::Char('d')), key(KeyCode::Char('y'))]);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+    assert!(app.unstaged.is_empty(), "worktree clean after discard");
+}
+
+fn two_hunk_repo() -> PathBuf {
+    let dir = temp_repo();
+    let base: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(dir.join("x.txt"), &base).unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    let changed = base
+        .replace("line2\n", "line2v2\n")
+        .replace("line3\n", "line3v2\n")
+        .replace("line18\n", "line18v2\n");
+    std::fs::write(dir.join("x.txt"), changed).unwrap();
+    dir
+}
+
+fn count_staged_changes(dir: &Path) -> usize {
+    let d = twit_core::repo::file_diff(dir, "x.txt", twit_core::repo::DiffMode::Staged).unwrap();
+    d.rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                twit_core::repo::DiffRow::Line { kind, .. }
+                    if *kind != twit_core::repo::LineKind::Context
+            )
+        })
+        .count()
+}
+
+#[test]
+fn visual_stage_selection_stages_only_selected_lines() {
+    let dir = two_hunk_repo();
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+    assert_eq!(app.active_tab, Tab::Diff);
+
+    app.handle_input(vec![key(KeyCode::Char('s'))]);
+    assert_eq!(
+        app.staged.len(),
+        1,
+        "partially staged file appears in staged"
+    );
+    assert_eq!(app.unstaged.len(), 1, "remaining lines stay unstaged");
+    assert_eq!(count_staged_changes(&dir), 1, "only the cursor line staged");
+}
+
+#[test]
+fn hunk_stage_stages_whole_hunk_under_cursor() {
+    let dir = two_hunk_repo();
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+
+    app.handle_input(vec![KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)]);
+    assert_eq!(app.staged.len(), 1);
+    assert_eq!(app.unstaged.len(), 1, "second hunk still unstaged");
+    assert_eq!(count_staged_changes(&dir), 2, "both lines of hunk 1 staged");
+}
+
+#[test]
+fn diff_discard_selection_confirms_then_reverts_lines() {
+    let dir = two_hunk_repo();
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+
+    app.handle_input(vec![key(KeyCode::Char('d'))]);
+    assert!(app.prompt.is_some(), "line discard asks for confirmation");
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    let content = std::fs::read_to_string(dir.join("x.txt")).unwrap();
+    assert!(content.contains("line2\n"), "cursor line reverted");
+    assert!(content.contains("line3v2\n"), "other lines untouched");
+    assert!(content.contains("line18v2\n"));
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn graph_create_branch_and_checkout_via_prompts() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+
+    app.handle_input(vec![key(KeyCode::Char('b'))]);
+    assert!(app.prompt.is_some(), "b opens branch name prompt");
+    type_text(&mut app, "dev");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(git_out(&dir, &["branch", "--list", "dev"]), "dev");
+
+    app.handle_input(vec![key(KeyCode::Char('o'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Checkout: 1) branch dev").is_some(),
+        "checkout prompt lists the non-head branch"
+    );
+    app.handle_input(vec![key(KeyCode::Char('1'))]);
+    assert_eq!(git_out(&dir, &["symbolic-ref", "HEAD"]), "refs/heads/dev");
+}
+
+#[test]
+fn graph_reset_soft_moves_head_and_keeps_index() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "first"]);
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "second"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    let target = app.graph.rows[1].id;
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+    ]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "(s)oft / (m)ixed / (h)ard").is_some());
+
+    app.handle_input(vec![key(KeyCode::Char('s'))]);
+    assert_eq!(git_out(&dir, &["rev-parse", "HEAD"]), target.to_string());
+    assert_eq!(app.staged.len(), 1, "soft reset keeps the change staged");
+}
+
+#[test]
+fn graph_hard_reset_needs_second_confirmation() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "first"]);
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "second"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    let head = git_out(&dir, &["rev-parse", "HEAD"]);
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        key(KeyCode::Char('h')),
+    ]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Hard reset discards").is_some());
+    app.handle_input(vec![key(KeyCode::Char('n'))]);
+    assert_eq!(git_out(&dir, &["rev-parse", "HEAD"]), head, "n keeps HEAD");
+
+    app.handle_input(vec![
+        KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        key(KeyCode::Char('h')),
+        key(KeyCode::Char('y')),
+    ]);
+    assert_ne!(git_out(&dir, &["rev-parse", "HEAD"]), head);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+}
+
+#[test]
+fn graph_cherry_pick_applies_commit_onto_head() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    git(&dir, &["checkout", "-qb", "feat"]);
+    std::fs::write(dir.join("f.txt"), "f\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "feat work"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    let feat_row = app
+        .graph
+        .rows
+        .iter()
+        .position(|r| r.summary == "feat work")
+        .expect("feat commit in graph");
+    for _ in 0..feat_row {
+        app.handle_input(vec![key(KeyCode::Char('j'))]);
+    }
+
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Cherry-pick").is_some(), "confirm prompt");
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+
+    assert!(app.error.is_none(), "cherry-pick ok: {:?}", app.error);
+    assert!(dir.join("f.txt").exists(), "picked file in worktree");
+    assert_eq!(
+        git_out(&dir, &["log", "--format=%s", "-1"]),
+        "feat work",
+        "picked commit on top of main"
+    );
+    assert_eq!(git_out(&dir, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+}
+
+#[test]
+fn graph_tag_create_delete_and_branch_rename() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+
+    app.handle_input(vec![key(KeyCode::Char('t'))]);
+    type_text(&mut app, "v1");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(git_out(&dir, &["tag", "-l", "v1"]), "v1");
+
+    app.handle_input(vec![key(KeyCode::Char('x'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Delete tag v1? (y/n)").is_some(),
+        "single deletable ref confirms directly"
+    );
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    assert_eq!(git_out(&dir, &["tag", "-l", "v1"]), "");
+
+    app.handle_input(vec![key(KeyCode::Char('r'))]);
+    let (_, input) = app.prompt.as_ref().expect("rename prompt");
+    assert_eq!(input.text(), "main", "prefilled with branch name");
+    for _ in 0..4 {
+        app.handle_input(vec![key(KeyCode::Backspace)]);
+    }
+    type_text(&mut app, "trunk");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(git_out(&dir, &["symbolic-ref", "HEAD"]), "refs/heads/trunk");
+}
+
+#[test]
+fn graph_interactive_rebase_requests_suspended_git() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "first"]);
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "second"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    let head = app.graph.rows[0].id;
+
+    app.handle_input(vec![key(KeyCode::Char('i'))]);
+    let argv = app.pending_shell.take().expect("i schedules git rebase -i");
+    assert_eq!(argv[0], "git");
+    assert_eq!(argv[3..5], ["rebase".to_string(), "-i".to_string()]);
+    assert_eq!(argv[5], format!("{head}^"));
+}
+
+fn wait_remote(app: &mut TuiApp) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.remote.is_some() {
+        app.poll_remote();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "remote operation timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn changes_folder_row_bulk_stages_and_folds() {
+    let dir = temp_repo();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "a\n").unwrap();
+    std::fs::write(dir.join("src/b.rs"), "b\n").unwrap();
+    std::fs::write(dir.join("top.txt"), "t\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("src/a.rs"), "a2\n").unwrap();
+    std::fs::write(dir.join("src/b.rs"), "b2\n").unwrap();
+    std::fs::write(dir.join("top.txt"), "t2\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "▾ src/").is_some(), "folder row rendered");
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('h')),
+    ]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "▸ src/").is_some(), "h folds the folder");
+    assert!(
+        find_line(&lines, "a.rs").is_none(),
+        "children hidden while folded"
+    );
+    assert!(
+        find_line(&lines, "top.txt").is_some(),
+        "siblings still listed"
+    );
+
+    app.handle_input(vec![key(KeyCode::Char('l'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "▾ src/").is_some(),
+        "l unfolds the folder"
+    );
+    assert!(find_line(&lines, "a.rs").is_some());
+
+    app.handle_input(vec![key(KeyCode::Char(' '))]);
+    assert_eq!(app.staged.len(), 2, "space on the folder stages its files");
+    assert_eq!(app.unstaged.len(), 1, "sibling file stays unstaged");
+
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Char('h'))]);
+    let items = app.changes_items();
+    assert!(
+        matches!(
+            items[app.changes_cursor],
+            twit::app::ChangesItem::Folder { .. }
+        ),
+        "h on a child jumps to the parent folder"
+    );
+
+    app.handle_input(vec![key(KeyCode::Char(' '))]);
+    assert!(app.staged.is_empty(), "space on the staged folder unstages");
+    assert_eq!(app.unstaged.len(), 3);
+}
+
+#[test]
+fn changes_group_row_bulk_discard_confirms() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "one2\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "two2\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Char('d'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Discard changes to all 2 files? (y/n)").is_some(),
+        "group discard confirms with a count"
+    );
+    app.handle_input(vec![key(KeyCode::Char('n'))]);
+    assert_eq!(app.unstaged.len(), 2, "n keeps the changes");
+
+    app.handle_input(vec![key(KeyCode::Char('d')), key(KeyCode::Char('y'))]);
+    assert!(app.unstaged.is_empty(), "y discards every unstaged file");
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "two\n");
+}
+
+#[test]
+fn stash_push_show_and_pop_via_prompts() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('z'))]);
+    assert_eq!(app.stashes.len(), 1, "z stashes the worktree");
+    assert!(app.unstaged.is_empty());
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Stashes (1)").is_some());
+
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+    let lines = screen(&mut app, 140, 30);
+    let row = find_line(&lines, "two").expect("stash diff rendered");
+    assert!(row.contains("one"), "old content on the left: {row}");
+
+    app.focus = Pane::Changes;
+    app.handle_input(vec![key(KeyCode::Char(' '))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "(p)op / (a)pply / (d)rop").is_some(),
+        "space on a stash opens the op picker"
+    );
+    app.handle_input(vec![key(KeyCode::Char('p'))]);
+    assert!(app.stashes.is_empty(), "pop removes the stash");
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n");
+}
+
+#[test]
+fn stash_drop_requires_confirmation() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('z'))]);
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char(' ')),
+        key(KeyCode::Char('d')),
+    ]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Drop stash@{0}? (y/n)").is_some());
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    assert!(app.stashes.is_empty());
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+}
+
+#[test]
+fn push_and_force_push_to_local_remote() {
+    let dir = temp_repo();
+    let origin = std::env::temp_dir().join(format!(
+        "twit-origin-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&origin);
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare"]);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+
+    app.handle_input(vec![key(KeyCode::Char('p'))]);
+    assert!(app.remote.is_some(), "p starts a push job");
+    wait_remote(&mut app);
+    assert!(app.error.is_none(), "push ok: {:?}", app.error);
+    assert_eq!(
+        git_out(&origin, &["rev-parse", "main"]),
+        git_out(&dir, &["rev-parse", "HEAD"])
+    );
+
+    git(&dir, &["commit", "--amend", "-qm", "rewritten"]);
+    app.refresh();
+    app.handle_input(vec![KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Force push current branch to origin? (y/n)").is_some(),
+        "force push asks first"
+    );
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    wait_remote(&mut app);
+    assert!(app.error.is_none(), "force push ok: {:?}", app.error);
+    assert_eq!(
+        git_out(&origin, &["rev-parse", "main"]),
+        git_out(&dir, &["rev-parse", "HEAD"])
+    );
+    let _ = std::fs::remove_dir_all(&origin);
+}
+
+#[test]
+fn conflicted_cherry_pick_shows_banner_and_aborts() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "base"]);
+    git(&dir, &["checkout", "-qb", "feat"]);
+    std::fs::write(dir.join("a.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "feat change"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    std::fs::write(dir.join("a.txt"), "main\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "main change"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    let feat_row = app
+        .graph
+        .rows
+        .iter()
+        .position(|r| r.summary == "feat change")
+        .expect("feat commit");
+    for _ in 0..feat_row {
+        app.handle_input(vec![key(KeyCode::Char('j'))]);
+    }
+    app.handle_input(vec![key(KeyCode::Char('y')), key(KeyCode::Char('y'))]);
+
+    assert!(
+        matches!(app.seq, Some((twit_core::repo::SeqState::CherryPick, _))),
+        "conflict leaves the sequencer active"
+    );
+    let lines = screen(&mut app, 140, 30);
+    let banner = find_line(&lines, "Cherry-pick in progress").expect("banner shown");
+    assert!(banner.contains("a.txt"), "conflict listed: {banner}");
+
+    app.handle_input(vec![KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "Abort the in-progress operation? (y/n)").is_some());
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    assert!(app.seq.is_none(), "abort clears the sequencer");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "main\n"
+    );
+}
+
+#[test]
+fn search_tab_finds_and_replaces_across_repo() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "hello needle world\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "no match here\nneedle again\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    app.active_tab = Tab::Search;
+
+    app.handle_input(vec![key(KeyCode::Char('/'))]);
+    assert!(app.prompt.is_some(), "/ opens the search prompt");
+    type_text(&mut app, "needle");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(app.search.hits.len(), 2, "both files hit");
+    assert_eq!(app.search.match_count(), 2);
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "2 matches in 2 files").is_some());
+    assert!(find_line(&lines, "needle again").is_some());
+
+    app.handle_input(vec![key(KeyCode::Char('r'))]);
+    type_text(&mut app, "thread");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Replace all matches with \"thread\"? (y/n)").is_some(),
+        "replace asks for confirmation"
+    );
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "hello thread world\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+        "no match here\nthread again\n"
+    );
+    assert!(
+        app.search.hits.is_empty(),
+        "results refreshed after replace"
+    );
+}
+
+#[test]
+fn search_tab_tree_folds_and_include_filter() {
+    let dir = temp_repo();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "needle in rust\n").unwrap();
+    std::fs::write(dir.join("docs/b.txt"), "needle in text\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    app.active_tab = Tab::Search;
+
+    app.handle_input(vec![key(KeyCode::Char('/'))]);
+    type_text(&mut app, "needle");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(app.search.hits.len(), 2, "both files hit");
+
+    let lines = screen(&mut app, 140, 30);
+    assert!(find_line(&lines, "docs/").is_some(), "folder row rendered");
+    assert!(find_line(&lines, "src/").is_some(), "folder row rendered");
+    assert!(find_line(&lines, "needle in text").is_some());
+
+    // cursor starts on the first row (docs/ folder); collapse it with h.
+    app.handle_input(vec![key(KeyCode::Char('h'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "needle in text").is_none(),
+        "collapsed folder hides its match lines"
+    );
+    assert!(find_line(&lines, "docs/").is_some(), "folder header stays");
+
+    // include filter to *.rs only drops the txt hit.
+    app.handle_input(vec![key(KeyCode::Char('i'))]);
+    type_text(&mut app, "**/*.rs");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(
+        app.search.hits.len(),
+        1,
+        "include glob keeps only the rust file"
+    );
+    assert_eq!(app.search.hits[0].path, "src/a.rs");
+
+    // rows: [Dir src, File a.rs, Line]; step down to the match line and open it.
+    app.handle_input(vec![key(KeyCode::Char('j'))]);
+    app.handle_input(vec![key(KeyCode::Char('j'))]);
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    let (path, line) = app
+        .pending_editor
+        .clone()
+        .expect("Enter queues an editor open");
+    assert!(path.ends_with("src/a.rs"));
+    assert_eq!(line, Some(1), "jump carries the match line number");
+}
+
+#[test]
+fn diff_find_jumps_and_highlights() {
+    let dir = two_hunk_repo();
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Enter),
+    ]);
+    assert_eq!(app.active_tab, Tab::Diff);
+
+    app.handle_input(vec![key(KeyCode::Char('/'))]);
+    assert!(app.prompt.is_some(), "/ opens find prompt in diff");
+    type_text(&mut app, "line18v2");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    let row = &app.diff.rows[app.diff_nav.cursor];
+    let hit = match row {
+        twit_core::repo::DiffRow::Line { right, .. } => {
+            right.as_deref().unwrap_or("").contains("line18v2")
+        }
+        _ => false,
+    };
+    assert!(hit, "cursor jumped to the match");
+
+    let before = app.diff_nav.cursor;
+    app.handle_input(vec![key(KeyCode::Char('n'))]);
+    assert_eq!(app.diff_nav.cursor, before, "single match wraps to itself");
+
+    app.handle_input(vec![key(KeyCode::Esc)]);
+    assert!(app.diff_find.is_none(), "esc clears the find query");
+}
+
+#[test]
+fn help_overlay_toggles_without_quitting() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![key(KeyCode::Char('?'))]);
+    assert!(app.help_open);
+    let lines = screen(&mut app, 140, 40);
+    assert!(find_line(&lines, "Keybindings").is_some());
+    assert!(find_line(&lines, "Stage/unstage the item under the cursor").is_some());
+
+    app.handle_input(vec![key(KeyCode::Char('q'))]);
+    assert!(!app.help_open, "q closes the help overlay");
+    assert!(!app.quit, "q inside help must not quit the app");
+}
+
+#[test]
+fn sidebar_initializes_submodule_via_prompt() {
+    let child = temp_repo();
+    std::fs::write(child.join("c.txt"), "c\n").unwrap();
+    git(&child, &["add", "-A"]);
+    git(&child, &["commit", "-qm", "child init"]);
+
+    let parent = temp_repo();
+    std::fs::write(parent.join("p.txt"), "p\n").unwrap();
+    git(&parent, &["add", "-A"]);
+    git(&parent, &["commit", "-qm", "parent init"]);
+    git(
+        &parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            child.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    git(&parent, &["commit", "-qm", "add submodule"]);
+
+    let clone = std::env::temp_dir().join(format!(
+        "twit-clone-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&clone);
+    git(
+        &parent,
+        &[
+            "clone",
+            "-q",
+            parent.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+
+    let mut app = TuiApp::new(&clone).unwrap();
+    app.focus = Pane::Sidebar;
+    let rows = app.sidebar_rows();
+    assert_eq!(rows.len(), 2, "clone shows the submodule row");
+    assert!(!rows[1].initialized, "submodule starts uninitialized");
+
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Char('i'))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Initialize submodule sub (clone)? (y/n)").is_some(),
+        "init asks for confirmation"
+    );
+    app.handle_input(vec![key(KeyCode::Char('y'))]);
+    wait_remote(&mut app);
+    assert!(app.error.is_none(), "init ok: {:?}", app.error);
+    let rows = app.sidebar_rows();
+    assert!(rows[1].initialized, "rediscover marks the submodule ready");
+    assert!(clone.join("sub/c.txt").exists(), "submodule cloned");
+    let _ = std::fs::remove_dir_all(&clone);
+}
+
+#[test]
+fn commit_diff_shows_full_multiline_message() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "first\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(
+        &dir,
+        &[
+            "commit",
+            "-qm",
+            "subject line",
+            "-m",
+            "body first paragraph",
+            "-m",
+            "body second paragraph",
+        ],
+    );
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(app.selected_commit.is_some());
+    assert_eq!(app.active_tab, Tab::Graph);
+
+    let lines = screen(&mut app, 140, 30);
+    let commit_idx = lines
+        .iter()
+        .position(|l| l.contains("subject line"))
+        .expect("commit row");
+    assert!(
+        lines[commit_idx + 1].contains("body first paragraph"),
+        "message body under expanded commit: {:?}",
+        &lines[commit_idx..commit_idx + 4]
+    );
+    let body2 = lines
+        .iter()
+        .position(|l| l.contains("body second paragraph"))
+        .expect("second body paragraph shown");
+    let file_row = lines
+        .iter()
+        .position(|l| l.contains("A a.txt"))
+        .expect("file row follows the message");
+    assert!(body2 < file_row);
+
+    app.handle_input(vec![key(KeyCode::Char('j'))]);
+    let items = app.graph_items();
+    assert!(
+        matches!(items[app.graph_cursor], twit::app::GraphItem::File(_)),
+        "cursor skips message lines: {:?}",
+        items[app.graph_cursor]
+    );
+
+    app.active_tab = Tab::Diff;
+    let lines = screen(&mut app, 140, 30);
+    let subject = lines
+        .iter()
+        .position(|l| l.contains("subject line"))
+        .expect("subject shown atop the commit diff");
+    assert!(find_line(&lines, "body first paragraph").is_some());
+    assert!(find_line(&lines, "body second paragraph").is_some());
+    let header = lines
+        .iter()
+        .position(|l| l.contains("a.txt"))
+        .expect("file header follows the message");
+    assert!(subject < header);
+}
+
+#[test]
+fn graph_expands_commit_files_as_tree_with_folding() {
+    let dir = temp_repo();
+    std::fs::create_dir_all(dir.join("src/app")).unwrap();
+    std::fs::write(dir.join("src/app/graph.rs"), "one\n").unwrap();
+    std::fs::write(dir.join("src/main.rs"), "main\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("src/app/graph.rs"), "two\n").unwrap();
+    std::fs::write(dir.join("src/main.rs"), "main2\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "tree change"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(app.commit_files.len(), 2);
+
+    let lines = screen(&mut app, 140, 30);
+    let commit_idx = lines
+        .iter()
+        .position(|l| l.contains("tree change"))
+        .expect("commit row");
+    let tail = lines[commit_idx + 1..].join("\n");
+    assert!(
+        tail.contains("▾ src/"),
+        "top-level folder row rendered as a tree: {tail}"
+    );
+    assert!(
+        tail.contains("▾ app/"),
+        "nested folder row rendered as a tree: {tail}"
+    );
+    assert!(
+        tail.contains("graph.rs") && !tail.contains("src/app/graph.rs"),
+        "file shown by basename under its folder: {tail}"
+    );
+
+    let src_folder = app
+        .graph_items()
+        .iter()
+        .position(|it| matches!(it, twit::app::GraphItem::Folder(p) if p == "src"))
+        .expect("src folder item");
+    app.graph_cursor = src_folder;
+    app.handle_input(vec![key(KeyCode::Char('h'))]);
+    assert!(
+        app.commit_folds.contains("src"),
+        "h folds the folder under the cursor"
+    );
+    let folded = screen(&mut app, 140, 30);
+    let ftail = folded[commit_idx + 1..].join("\n");
+    assert!(
+        ftail.contains("▸ src/"),
+        "folded folder shows a closed marker"
+    );
+    assert!(
+        !ftail.contains("graph.rs"),
+        "folded folder hides its files: {ftail}"
+    );
+
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(
+        !app.commit_folds.contains("src"),
+        "enter on a folded folder reopens it"
+    );
+}
+
+#[test]
+fn graph_expands_commit_files_and_opens_per_file_diff() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "first\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "bee\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "second\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "change a"]);
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(app.selected_commit.is_some(), "enter selects head commit");
+    assert_eq!(app.commit_files.len(), 1);
+    assert_eq!(
+        app.active_tab,
+        Tab::Graph,
+        "stays on graph to pick a file; whole-commit diff loads in background"
+    );
+    assert!(!app.diff.rows.is_empty(), "whole-commit diff loaded");
+
+    let lines = screen(&mut app, 140, 30);
+    let commit_idx = lines
+        .iter()
+        .position(|l| l.contains("change a"))
+        .expect("commit row");
+    assert!(
+        lines[commit_idx + 1].contains("M a.txt"),
+        "file row right under expanded commit: {:?}",
+        &lines[commit_idx..commit_idx + 2]
+    );
+
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Enter)]);
+    assert_eq!(app.selected_commit_file, Some("a.txt".to_string()));
+    assert_eq!(app.active_tab, Tab::Diff);
+    let lines = screen(&mut app, 140, 30);
+    let row = find_line(&lines, "second").expect("per-file diff rendered");
+    assert!(row.contains("first"), "old content on the left: {row}");
+
+    app.active_tab = Tab::Graph;
+    app.handle_input(vec![key(KeyCode::Char('h'))]);
+    let items = app.graph_items();
+    assert!(
+        matches!(items[app.graph_cursor], twit::app::GraphItem::Commit(_)),
+        "h jumps back to the commit row"
+    );
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert_eq!(
+        app.selected_commit_file, None,
+        "enter reopens whole-commit diff"
+    );
+    assert_eq!(app.active_tab, Tab::Graph, "still on graph after reopening");
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(app.selected_commit.is_none(), "second enter collapses");
+    assert!(app.commit_files.is_empty());
+}
+
+#[test]
+fn graph_expands_uncommitted_node_and_opens_file_diff() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("a.txt"), "first\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.txt"), "second\n").unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.focus = Pane::RightTab;
+
+    let top = &app.graph.rows[0];
+    assert!(
+        top.is_uncommitted,
+        "uncommitted node is the first graph row"
+    );
+
+    app.handle_input(vec![key(KeyCode::Enter)]);
+    assert!(
+        app.selected_commit.is_some_and(|o| o.is_zero()),
+        "enter selects the uncommitted node"
+    );
+    assert_eq!(app.commit_files.len(), 1, "uncommitted file listed");
+    assert_eq!(app.active_tab, Tab::Graph, "stays on graph to pick a file");
+
+    let lines = screen(&mut app, 140, 30);
+    let node_idx = lines
+        .iter()
+        .position(|l| l.contains("Uncommitted"))
+        .expect("uncommitted row");
+    assert!(
+        lines[node_idx + 1].contains("a.txt"),
+        "file row under the uncommitted node: {:?}",
+        &lines[node_idx..node_idx + 2]
+    );
+
+    app.handle_input(vec![key(KeyCode::Char('j')), key(KeyCode::Enter)]);
+    assert_eq!(app.selected_commit_file, Some("a.txt".to_string()));
+    assert_eq!(app.active_tab, Tab::Diff);
+    let lines = screen(&mut app, 140, 30);
+    let row = find_line(&lines, "second").expect("per-file diff rendered");
+    assert!(row.contains("first"), "old content on the left: {row}");
+}
+
+#[test]
+fn renamed_file_stages_and_unstages_in_one_toggle() {
+    let dir = temp_repo();
+    std::fs::write(dir.join("old.txt"), "hello\nworld\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
+
+    let mut app = TuiApp::new(&dir).unwrap();
+    app.handle_input(vec![
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char(' ')),
+    ]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Changes (0)").is_some(),
+        "nothing left unstaged"
+    );
+    assert!(
+        find_line(&lines, "Staged (1)").is_some(),
+        "one staged entry"
+    );
+
+    app.handle_input(vec![key(KeyCode::Char('k')), key(KeyCode::Char(' '))]);
+    let lines = screen(&mut app, 140, 30);
+    assert!(
+        find_line(&lines, "Staged (0)").is_some(),
+        "nothing left staged"
+    );
+    assert!(
+        find_line(&lines, "Changes (1)").is_some(),
+        "one unstaged entry"
+    );
+}
